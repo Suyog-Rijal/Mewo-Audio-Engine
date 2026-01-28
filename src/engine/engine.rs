@@ -9,19 +9,24 @@ use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
 use crate::engine::buffer::{create_audio_buffer, AudioBufferProducer};
 use crate::engine::output::{AudioOutput, cpal_backend::CpalBackend, output_manager::OutputManager};
 use crate::engine::dsp::resampler::Resampler;
+use crate::engine::dsp::bass::BassProcessor;
 
 enum DecoderCommand {
     Seek(f64),
     Stop,
+    SetBassBoost(bool),
+    SetBassIntensity(f32),
 }
 
 pub struct AudioEngine {
     clock: Arc<Clock>,
-    output: Box<dyn AudioOutput>,
+    output: Box<dyn AudioOutput + Send>,
     producer: Option<AudioBufferProducer>,
     decode_thread: Option<JoinHandle<()>>,
     is_decoding: Arc<AtomicBool>,
     command_tx: Option<Sender<DecoderCommand>>,
+    bass_boost_enabled: Arc<AtomicBool>,
+    bass_boost_intensity: Arc<std::sync::Mutex<f32>>,
 }
 
 impl AudioEngine {
@@ -40,6 +45,8 @@ impl AudioEngine {
             decode_thread: None,
             is_decoding: Arc::new(AtomicBool::new(false)),
             command_tx: None,
+            bass_boost_enabled: Arc::new(AtomicBool::new(false)),
+            bass_boost_intensity: Arc::new(std::sync::Mutex::new(50.0)),
         })
     }
 
@@ -50,6 +57,8 @@ impl AudioEngine {
         let mut producer = self.producer.take().ok_or("Producer already in use or missing")?;
         let is_decoding = self.is_decoding.clone();
         let clock = self.clock.clone();
+        let bass_boost_enabled = self.bass_boost_enabled.clone();
+        let bass_boost_intensity = self.bass_boost_intensity.clone();
         
         let mut output_sample_rate = self.clock.get_sample_rate();
         let mut output_channels = self.clock.get_channels();
@@ -62,6 +71,12 @@ impl AudioEngine {
         } else {
             None
         };
+
+        let mut bass_processor = BassProcessor::new(output_sample_rate as f32, output_channels as usize);
+        bass_processor.set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
+        if let Ok(intensity) = bass_boost_intensity.lock() {
+            bass_processor.set_intensity(*intensity);
+        }
         
         let (tx, rx) = mpsc::channel();
         self.command_tx = Some(tx);
@@ -81,6 +96,12 @@ impl AudioEngine {
                         DecoderCommand::Stop => {
                             is_decoding.store(false, Ordering::SeqCst);
                             break;
+                        }
+                        DecoderCommand::SetBassBoost(enabled) => {
+                            bass_processor.set_enabled(enabled);
+                        }
+                        DecoderCommand::SetBassIntensity(intensity) => {
+                            bass_processor.set_intensity(intensity);
                         }
                     }
                 }
@@ -104,6 +125,12 @@ impl AudioEngine {
                     } else {
                         None
                     };
+
+                    bass_processor = BassProcessor::new(output_sample_rate as f32, output_channels as usize);
+                    bass_processor.set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
+                    if let Ok(intensity) = bass_boost_intensity.lock() {
+                        bass_processor.set_intensity(*intensity);
+                    }
                     
                     // Clear producer when output config changes to avoid glitches
                     producer.clear();
@@ -116,14 +143,16 @@ impl AudioEngine {
                 }
 
                 if let Some(samples) = decoder.decode_next() {
-                    let processed_samples = if let Some(r) = &mut resampler {
+                    let mut processed_samples = if let Some(r) = &mut resampler {
                         r.process(&samples).unwrap_or_else(|e| {
                             eprintln!("Resampling error: {}", e);
-                            samples // Fallback to original on error (not ideal)
+                            samples.clone() // Fallback to original on error
                         })
                     } else {
                         samples
                     };
+
+                    bass_processor.process(&mut processed_samples);
 
                     let mut pushed = 0;
                     while pushed < processed_samples.len() {
@@ -142,6 +171,12 @@ impl AudioEngine {
                                 DecoderCommand::Stop => {
                                     is_decoding.store(false, Ordering::SeqCst);
                                     break;
+                                }
+                                DecoderCommand::SetBassBoost(enabled) => {
+                                    bass_processor.set_enabled(enabled);
+                                }
+                                DecoderCommand::SetBassIntensity(intensity) => {
+                                    bass_processor.set_intensity(intensity);
                                 }
                             }
                         }
@@ -197,6 +232,22 @@ impl AudioEngine {
         
         // Reset position
         self.clock.set_sample_pos(0);
+    }
+
+    pub fn set_bass_boost(&self, enabled: bool) {
+        self.bass_boost_enabled.store(enabled, Ordering::SeqCst);
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(DecoderCommand::SetBassBoost(enabled));
+        }
+    }
+
+    pub fn set_bass_intensity(&self, intensity: f32) {
+        if let Ok(mut lock) = self.bass_boost_intensity.lock() {
+            *lock = intensity.clamp(0.0, 100.0);
+        }
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(DecoderCommand::SetBassIntensity(intensity));
+        }
     }
 
     pub fn seek(&mut self, time_secs: f64) {

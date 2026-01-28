@@ -5,7 +5,7 @@ use crate::engine::buffer::AudioBufferConsumer;
 use crate::engine::clock::Clock;
 use std::sync::Arc;
 
-pub trait AudioOutput {
+pub trait AudioOutput: Send {
     /// Starts the audio output stream.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>>;
 
