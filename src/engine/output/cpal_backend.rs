@@ -83,6 +83,11 @@ fn process_audio<T: Sample + FromSample<f32>>(
     consumer: &mut AudioBufferConsumer,
     clock: &Arc<Clock>,
 ) {
+    if clock.should_clear_buffer() {
+        consumer.clear();
+        clock.reset_clear_buffer();
+    }
+
     if clock.get_state() != PlaybackState::Playing {
         for sample in data.iter_mut() {
             *sample = T::from_sample(0.0);

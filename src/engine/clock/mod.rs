@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicBool, Ordering};
 
 /// Represents the current playback state of the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub struct Clock {
     channels: AtomicU8,
     /// Current state of playback (Stored as u8 for atomicity).
     state: AtomicU8,
+    /// Flag to signal the buffer should be cleared.
+    clear_buffer: AtomicBool,
 }
 
 impl Clock {
@@ -40,6 +42,7 @@ impl Clock {
             sample_rate: AtomicU64::new(sample_rate as u64),
             channels: AtomicU8::new(2),
             state: AtomicU8::new(PlaybackState::Stopped as u8),
+            clear_buffer: AtomicBool::new(false),
         }
     }
 
@@ -98,5 +101,17 @@ impl Clock {
 
     pub fn get_channels(&self) -> u32 {
         self.channels.load(Ordering::Relaxed) as u32
+    }
+
+    pub fn signal_clear_buffer(&self) {
+        self.clear_buffer.store(true, Ordering::SeqCst);
+    }
+
+    pub fn should_clear_buffer(&self) -> bool {
+        self.clear_buffer.load(Ordering::Relaxed)
+    }
+
+    pub fn reset_clear_buffer(&self) {
+        self.clear_buffer.store(false, Ordering::SeqCst);
     }
 }

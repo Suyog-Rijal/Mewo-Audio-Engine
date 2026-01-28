@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::mpsc::{self, Sender};
 
 use crate::engine::clock::{Clock, PlaybackState};
 use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
@@ -95,7 +95,6 @@ impl AudioEngine {
                                 DecoderCommand::Seek(time) => {
                                     decoder.seek(time);
                                     producer.clear();
-                                    pushed = samples.len(); // Skip remaining samples of this chunk
                                     break;
                                 }
                                 DecoderCommand::Stop => {
@@ -155,6 +154,7 @@ impl AudioEngine {
     pub fn seek(&mut self, time_secs: f64) {
         let sample_pos = (time_secs * self.clock.get_sample_rate() as f64 * self.clock.get_channels() as f64) as u64;
         self.clock.set_sample_pos(sample_pos);
+        self.clock.signal_clear_buffer();
         
         if let Some(tx) = &self.command_tx {
             let _ = tx.send(DecoderCommand::Seek(time_secs));
