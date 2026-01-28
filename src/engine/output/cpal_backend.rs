@@ -1,61 +1,110 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Stream, StreamConfig, SampleFormat, FromSample, Sample};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::engine::buffer::AudioBufferConsumer;
 use crate::engine::clock::{Clock, PlaybackState};
 use crate::engine::output::AudioOutput;
 
 pub struct CpalBackend {
     _stream: Stream,
+    device_id: String,
+    is_healthy: Arc<AtomicBool>,
+    consumer: Arc<Mutex<Option<AudioBufferConsumer>>>,
 }
 
 impl CpalBackend {
     pub fn new(
-        mut consumer: AudioBufferConsumer,
+        consumer: AudioBufferConsumer,
         clock: Arc<Clock>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, (AudioBufferConsumer, Box<dyn std::error::Error>)> {
         let host = cpal::default_host();
-        let device = host.default_output_device()
-            .ok_or("No output device available")?;
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => return Err((consumer, "No output device available".into())),
+        };
 
-        let config: StreamConfig = device.default_output_config()?.into();
-        let sample_format = device.default_output_config()?.sample_format();
+        let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
 
-        // Update clock's sample rate and channels based on hardware
+        let config_res = device.default_output_config();
+        let config_inner = match config_res {
+            Ok(c) => c,
+            Err(e) => return Err((consumer, e.into())),
+        };
+
+        let sample_format = config_inner.sample_format();
+        let config: StreamConfig = config_inner.into();
+
         clock.set_sample_rate(config.sample_rate);
         clock.set_channels(config.channels as u32);
 
-        let err_fn = |err| eprintln!("An error occurred on the output audio stream: {}", err);
+        let is_healthy = Arc::new(AtomicBool::new(true));
+        let is_healthy_err = is_healthy.clone();
 
-        let stream = match sample_format {
+        let err_fn = move |err| {
+            // eprintln!("An error occurred on the output audio stream: {}", err);
+            is_healthy_err.store(false, Ordering::SeqCst);
+        };
+
+        let shared_consumer = Arc::new(Mutex::new(Some(consumer)));
+        let consumer_for_callback = shared_consumer.clone();
+        let clock_for_callback = clock.clone();
+
+        let stream_res = match sample_format {
             SampleFormat::F32 => device.build_output_stream(
                 &config,
                 move |data: &mut [f32], _| {
-                    process_audio(data, &mut consumer, &clock);
+                    if let Ok(mut guard) = consumer_for_callback.lock() {
+                        if let Some(c) = guard.as_mut() {
+                            process_audio(data, c, &clock_for_callback);
+                        }
+                    }
                 },
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::I16 => device.build_output_stream(
                 &config,
                 move |data: &mut [i16], _| {
-                    process_audio(data, &mut consumer, &clock);
+                    if let Ok(mut guard) = consumer_for_callback.lock() {
+                        if let Some(c) = guard.as_mut() {
+                            process_audio(data, c, &clock_for_callback);
+                        }
+                    }
                 },
                 err_fn,
                 None,
-            )?,
+            ),
             SampleFormat::U16 => device.build_output_stream(
                 &config,
                 move |data: &mut [u16], _| {
-                    process_audio(data, &mut consumer, &clock);
+                    if let Ok(mut guard) = consumer_for_callback.lock() {
+                        if let Some(c) = guard.as_mut() {
+                            process_audio(data, c, &clock_for_callback);
+                        }
+                    }
                 },
                 err_fn,
                 None,
-            )?,
-            _ => return Err("Unsupported sample format".into()),
+            ),
+            _ => {
+                let consumer = shared_consumer.lock().unwrap().take().unwrap();
+                return Err((consumer, "Unsupported sample format".into()));
+            }
         };
 
-        Ok(Self { _stream: stream })
+        match stream_res {
+            Ok(stream) => Ok(Self { 
+                _stream: stream, 
+                device_id,
+                is_healthy, 
+                consumer: shared_consumer 
+            }),
+            Err(e) => {
+                let consumer = shared_consumer.lock().unwrap().take().unwrap();
+                Err((consumer, e.into())) 
+            }
+        }
     }
 }
 
@@ -71,9 +120,35 @@ impl AudioOutput for CpalBackend {
     }
 
     fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self._stream.pause()?;
-        // Additional cleanup if needed
+        let _ = self._stream.pause();
         Ok(())
+    }
+
+    fn is_healthy(&self) -> bool {
+        if !self.is_healthy.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        // Check if default device has changed
+        let host = cpal::default_host();
+        if let Some(device) = host.default_output_device() {
+            if let Ok(name) = device.name() {
+                if name != self.device_id {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn shutdown(&mut self) -> Option<AudioBufferConsumer> {
+        let _ = self._stream.pause();
+        self.consumer.lock().ok()?.take()
+    }
+
+    fn tick(&mut self) {
+        // CpalBackend doesn't do much on tick, it's mostly for the manager
     }
 }
 

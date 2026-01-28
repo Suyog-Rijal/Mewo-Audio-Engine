@@ -70,6 +70,13 @@ impl AudioBufferConsumer {
     pub fn clear(&mut self) {
         while self.pop().is_some() {}
     }
+
+    /// Creates an empty consumer (useful for error handling)
+    pub fn empty() -> Self {
+        let rb = HeapRb::<f32>::new(1);
+        let (_, cons) = rb.split();
+        AudioBufferConsumer { inner: cons }
+    }
 }
 
 /// Creates a new audio buffer with the specified capacity.

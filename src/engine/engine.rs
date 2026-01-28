@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Sender};
 use crate::engine::clock::{Clock, PlaybackState};
 use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
 use crate::engine::buffer::{create_audio_buffer, AudioBufferProducer};
-use crate::engine::output::{AudioOutput, cpal_backend::CpalBackend};
+use crate::engine::output::{AudioOutput, cpal_backend::CpalBackend, output_manager::OutputManager};
 use crate::engine::dsp::resampler::Resampler;
 
 enum DecoderCommand {
@@ -31,7 +31,7 @@ impl AudioEngine {
         // Create buffer with a reasonable capacity (e.g., 1 second of stereo audio)
         let (producer, consumer) = create_audio_buffer(44100 * 2);
         
-        let output = Box::new(CpalBackend::new(consumer, clock.clone())?);
+        let output = Box::new(OutputManager::new(consumer, clock.clone()));
         
         Ok(Self {
             clock,
@@ -51,13 +51,14 @@ impl AudioEngine {
         let is_decoding = self.is_decoding.clone();
         let clock = self.clock.clone();
         
-        let output_sample_rate = self.clock.get_sample_rate();
+        let mut output_sample_rate = self.clock.get_sample_rate();
+        let mut output_channels = self.clock.get_channels();
         let decoder_sample_rate = decoder.sample_rate();
-        let channels = decoder.channels() as usize;
+        let decoder_channels = decoder.channels() as usize;
         
-        let mut resampler = if output_sample_rate != decoder_sample_rate {
-            println!("Initializing resampler: {}Hz -> {}Hz", decoder_sample_rate, output_sample_rate);
-            Some(Resampler::new(decoder_sample_rate, output_sample_rate, channels, 1024)?)
+        let mut resampler = if output_sample_rate != decoder_sample_rate || output_channels != decoder_channels as u32 {
+            println!("Initializing resampler: {}Hz -> {}Hz, {}ch -> {}ch", decoder_sample_rate, output_sample_rate, decoder_channels, output_channels);
+            Some(Resampler::new(decoder_sample_rate, output_sample_rate, decoder_channels, 1024)?)
         } else {
             None
         };
@@ -86,6 +87,26 @@ impl AudioEngine {
 
                 if !is_decoding.load(Ordering::Relaxed) {
                     break;
+                }
+
+                // Check if output sample rate or channels changed and we need to update resampler
+                let current_output_rate = clock.get_sample_rate();
+                let current_output_channels = clock.get_channels();
+                if current_output_rate != output_sample_rate || current_output_channels != output_channels {
+                    println!("Output config changed: {}Hz/{}ch -> {}Hz/{}ch. Reinitializing resampler.", 
+                        output_sample_rate, output_channels, current_output_rate, current_output_channels);
+                    
+                    output_sample_rate = current_output_rate;
+                    output_channels = current_output_channels;
+                    
+                    resampler = if output_sample_rate != decoder_sample_rate || output_channels != decoder_channels as u32 {
+                        Some(Resampler::new(decoder_sample_rate, output_sample_rate, decoder_channels, 1024).unwrap())
+                    } else {
+                        None
+                    };
+                    
+                    // Clear producer when output config changes to avoid glitches
+                    producer.clear();
                 }
 
                 // If buffer is full, sleep briefly to avoid pegging CPU
@@ -190,6 +211,10 @@ impl AudioEngine {
 
     pub fn get_time_secs(&self) -> f64 {
         self.clock.get_time_secs()
+    }
+
+    pub fn tick(&mut self) {
+        self.output.tick();
     }
 }
 

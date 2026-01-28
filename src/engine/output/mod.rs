@@ -1,4 +1,5 @@
 pub mod cpal_backend;
+pub mod output_manager;
 
 use crate::engine::buffer::AudioBufferConsumer;
 use crate::engine::clock::Clock;
@@ -13,4 +14,13 @@ pub trait AudioOutput {
 
     /// Stops the audio output stream.
     fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Checks if the output is still healthy.
+    fn is_healthy(&self) -> bool;
+
+    /// Shutdown the backend and return the consumer if possible.
+    fn shutdown(&mut self) -> Option<AudioBufferConsumer>;
+
+    /// Periodically check for device changes or health issues.
+    fn tick(&mut self);
 }
