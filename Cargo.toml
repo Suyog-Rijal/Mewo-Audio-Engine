@@ -1,0 +1,10 @@
+[package]
+name = "test_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+symphonia = { version = "0.5.5", features = ["all"]}
+ringbuf = "0.4.8"
+rubato = "1.0.1"
+cpal = "0.17.1"
