@@ -8,3 +8,4 @@ symphonia = { version = "0.5.5", features = ["all"]}
 ringbuf = "0.4.8"
 rubato = "1.0.1"
 cpal = "0.17.1"
+audioadapter-buffers = "2.0.0"

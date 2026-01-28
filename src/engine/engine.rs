@@ -8,6 +8,7 @@ use crate::engine::clock::{Clock, PlaybackState};
 use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
 use crate::engine::buffer::{create_audio_buffer, AudioBufferProducer};
 use crate::engine::output::{AudioOutput, cpal_backend::CpalBackend};
+use crate::engine::dsp::resampler::Resampler;
 
 enum DecoderCommand {
     Seek(f64),
@@ -50,6 +51,17 @@ impl AudioEngine {
         let is_decoding = self.is_decoding.clone();
         let clock = self.clock.clone();
         
+        let output_sample_rate = self.clock.get_sample_rate();
+        let decoder_sample_rate = decoder.sample_rate();
+        let channels = decoder.channels() as usize;
+        
+        let mut resampler = if output_sample_rate != decoder_sample_rate {
+            println!("Initializing resampler: {}Hz -> {}Hz", decoder_sample_rate, output_sample_rate);
+            Some(Resampler::new(decoder_sample_rate, output_sample_rate, channels, 1024)?)
+        } else {
+            None
+        };
+        
         let (tx, rx) = mpsc::channel();
         self.command_tx = Some(tx);
         
@@ -83,8 +95,17 @@ impl AudioEngine {
                 }
 
                 if let Some(samples) = decoder.decode_next() {
+                    let processed_samples = if let Some(r) = &mut resampler {
+                        r.process(&samples).unwrap_or_else(|e| {
+                            eprintln!("Resampling error: {}", e);
+                            samples // Fallback to original on error (not ideal)
+                        })
+                    } else {
+                        samples
+                    };
+
                     let mut pushed = 0;
-                    while pushed < samples.len() {
+                    while pushed < processed_samples.len() {
                         if !is_decoding.load(Ordering::Relaxed) {
                             break;
                         }
@@ -104,14 +125,20 @@ impl AudioEngine {
                             }
                         }
 
-                        let n = producer.push_slice(&samples[pushed..]);
+                        let n = producer.push_slice(&processed_samples[pushed..]);
                         pushed += n;
-                        if pushed < samples.len() {
+                        if pushed < processed_samples.len() {
                             thread::sleep(std::time::Duration::from_millis(5));
                         }
                     }
                 } else {
                     // EOF or Error
+                    // Flush resampler if active
+                    if let Some(r) = &mut resampler {
+                        if let Ok(flushed) = r.flush() {
+                            producer.push_slice(&flushed);
+                        }
+                    }
                     is_decoding.store(false, Ordering::SeqCst);
                     break;
                 }

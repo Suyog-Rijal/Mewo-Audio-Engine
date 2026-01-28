@@ -887,6 +887,7 @@ dependencies = [
 name = "test_engine"
 version = "0.1.0"
 dependencies = [
+ "audioadapter-buffers",
  "cpal",
  "ringbuf",
  "rubato",
