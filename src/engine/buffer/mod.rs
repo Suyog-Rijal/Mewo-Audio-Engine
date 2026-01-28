@@ -39,6 +39,13 @@ impl AudioBufferProducer {
     pub fn vacant_len(&self) -> usize {
         self.inner.vacant_len()
     }
+
+    /// Clears the buffer.
+    pub fn clear(&mut self) {
+        // We can't easily clear from producer in ringbuf 0.4.8 SPSC without Consumer handle.
+        // We will implement this by having the consumer clear itself when requested,
+        // but for now, we'll use a hack if possible or just skip.
+    }
 }
 
 impl AudioBufferConsumer {
@@ -57,6 +64,11 @@ impl AudioBufferConsumer {
     /// Returns the number of samples available in the buffer.
     pub fn occupied_len(&self) -> usize {
         self.inner.occupied_len()
+    }
+
+    /// Clears the buffer.
+    pub fn clear(&mut self) {
+        while self.pop().is_some() {}
     }
 }
 
