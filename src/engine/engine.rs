@@ -1,17 +1,17 @@
-use std::path::Path;
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
-use std::time::Duration;
-use crate::engine::clock::{Clock, PlaybackState};
-use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
 use crate::engine::buffer::{create_audio_buffer, AudioBufferProducer};
-use crate::engine::output::{AudioOutput, output_manager::OutputManager};
+use crate::engine::clock::{Clock, PlaybackState};
+use crate::engine::decoder::{symphonia_decoder::SymphoniaDecoder, AudioDecoder, AudioMetadata};
+use crate::engine::output::{output_manager::OutputManager, AudioOutput};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use crate::engine::dsp::resampler::Resampler;
 use crate::engine::dsp::dsp_chain::DspChain;
+use crate::engine::dsp::resampler::Resampler;
 
 enum DecoderCommand {
     Seek(f64),
@@ -22,15 +22,17 @@ enum DecoderCommand {
 
 pub struct AudioEngine {
     clock: Arc<Clock>,
-    // Wrapped in Arc<Mutex<>> so it can be shared between the decoder thread, main thread, and playback ticker thread
     output: Arc<Mutex<Box<dyn AudioOutput + Send>>>,
     producer: Option<AudioBufferProducer>,
+    // Channel to receive the producer back from the decoder thread when it finishes
+    producer_return_rx: Option<Receiver<AudioBufferProducer>>,
     decode_thread: Option<JoinHandle<()>>,
     playback_thread: Option<JoinHandle<()>>,
     is_decoding: Arc<AtomicBool>,
     command_tx: Option<Sender<DecoderCommand>>,
     bass_boost_enabled: Arc<AtomicBool>,
     bass_boost_intensity: Arc<std::sync::Mutex<f32>>,
+    current_metadata: Option<AudioMetadata>,
 }
 
 impl AudioEngine {
@@ -42,18 +44,30 @@ impl AudioEngine {
             clock,
             output: Arc::new(Mutex::new(Box::new(output))),
             producer: Some(producer),
+            producer_return_rx: None,
             decode_thread: None,
             playback_thread: None,
             is_decoding: Arc::new(AtomicBool::new(false)),
             command_tx: None,
             bass_boost_enabled: Arc::new(AtomicBool::new(false)),
             bass_boost_intensity: Arc::new(std::sync::Mutex::new(50.0)),
+            current_metadata: None,
         })
     }
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Stop existing playback (this handles joining threads and returning the producer)
         self.stop();
+
         let mut decoder = SymphoniaDecoder::new(path)?;
+
+        // --- CAPTURE METADATA ---
+        self.current_metadata = decoder.metadata();
+
+        // 2. Setup the return channel for the producer
+        let (producer_tx, producer_rx) = mpsc::channel();
+        self.producer_return_rx = Some(producer_rx);
+
         let mut producer = self.producer.take().ok_or("Producer missing")?;
 
         let is_decoding = self.is_decoding.clone();
@@ -66,14 +80,21 @@ impl AudioEngine {
         let decoder_rate = decoder.sample_rate();
         let decoder_channels = decoder.channels() as usize;
 
-        let mut resampler = if decoder_rate != output_rate || decoder_channels != output_channels as usize {
-            Some(Resampler::new(decoder_rate, output_rate, decoder_channels, 1024)?)
-        } else {
-            None
-        };
+        let mut resampler =
+            if decoder_rate != output_rate || decoder_channels != output_channels as usize {
+                Some(Resampler::new(
+                    decoder_rate,
+                    output_rate,
+                    decoder_channels,
+                    1024,
+                )?)
+            } else {
+                None
+            };
 
         let mut dsp = DspChain::new(output_rate as f32, output_channels as usize);
-        dsp.bass.set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
+        dsp.bass
+            .set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
         if let Ok(v) = bass_boost_intensity.lock() {
             dsp.bass.set_intensity(*v);
         }
@@ -85,6 +106,7 @@ impl AudioEngine {
         clock.set_sample_pos(0);
 
         let handle = thread::spawn(move || {
+            // Main decoding loop
             while is_decoding.load(Ordering::Relaxed) {
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd {
@@ -95,7 +117,7 @@ impl AudioEngine {
                         }
                         DecoderCommand::Stop => {
                             is_decoding.store(false, Ordering::SeqCst);
-                            return;
+                            return; // Return early, execute defer logic below
                         }
                         DecoderCommand::SetBassBoost(v) => dsp.bass.set_enabled(v),
                         DecoderCommand::SetBassIntensity(v) => dsp.bass.set_intensity(v),
@@ -107,13 +129,19 @@ impl AudioEngine {
                 if rate != output_rate || ch != output_channels {
                     output_rate = rate;
                     output_channels = ch;
-                    resampler = if decoder_rate != output_rate || decoder_channels != output_channels as usize {
-                        Some(Resampler::new(decoder_rate, output_rate, decoder_channels, 1024).unwrap())
+                    resampler = if decoder_rate != output_rate
+                        || decoder_channels != output_channels as usize
+                    {
+                        Some(
+                            Resampler::new(decoder_rate, output_rate, decoder_channels, 1024)
+                                .unwrap(),
+                        )
                     } else {
                         None
                     };
                     dsp = DspChain::new(output_rate as f32, output_channels as usize);
-                    dsp.bass.set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
+                    dsp.bass
+                        .set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
                     if let Ok(v) = bass_boost_intensity.lock() {
                         dsp.bass.set_intensity(*v);
                     }
@@ -147,12 +175,22 @@ impl AudioEngine {
                     }
                     clock.set_eos(true);
                     is_decoding.store(false, Ordering::SeqCst);
-                    return;
+                    return; // Song finished
                 }
             }
+
+            // --- CRITICAL FIX: Return producer to engine before thread dies ---
+            // We use let _ = ... to ignore errors if the receiver was dropped (unlikely)
+            let _ = producer_tx.send(producer);
         });
 
         self.decode_thread = Some(handle);
+        Ok(())
+    }
+
+    pub fn load_and_play<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        self.load(path)?;
+        self.play()?;
         Ok(())
     }
 
@@ -161,25 +199,20 @@ impl AudioEngine {
             return Ok(());
         }
 
-        // Ensure any previous playback thread is cleaned up
         if let Some(h) = self.playback_thread.take() {
             let _ = h.join();
         }
 
         self.clock.set_state(PlaybackState::Playing);
 
-        // Lock output to start the stream
         if let Ok(mut out) = self.output.lock() {
             out.start()?;
         }
 
-        // Spawn a background thread to handle "ticking" (device management)
         let output_arc = self.output.clone();
         let clock = self.clock.clone();
 
         let handle = thread::spawn(move || {
-            // This loop runs as long as the state is not Stopped
-            // It handles device reconnection and health checks automatically
             while clock.get_state() != PlaybackState::Stopped {
                 if let Ok(mut out) = output_arc.lock() {
                     out.tick();
@@ -203,23 +236,29 @@ impl AudioEngine {
     pub fn stop(&mut self) {
         self.clock.set_state(PlaybackState::Stopped);
 
-        // Stop output stream
         if let Ok(mut out) = self.output.lock() {
+            out.clear_buffer();
             let _ = out.stop();
         }
 
-        // Stop decoder
         if let Some(tx) = self.command_tx.take() {
             let _ = tx.send(DecoderCommand::Stop);
         }
         self.is_decoding.store(false, Ordering::SeqCst);
+
         if let Some(h) = self.decode_thread.take() {
             let _ = h.join();
         }
 
-        // Stop the playback management thread
         if let Some(h) = self.playback_thread.take() {
             let _ = h.join();
+        }
+
+        // --- CRITICAL FIX: Recover the producer from the finished thread ---
+        if let Some(rx) = self.producer_return_rx.take() {
+            if let Ok(p) = rx.recv() {
+                self.producer = Some(p);
+            }
         }
 
         self.clock.set_sample_pos(0);
@@ -243,7 +282,8 @@ impl AudioEngine {
     }
 
     pub fn seek(&mut self, time: f64) {
-        let pos = (time * self.clock.get_sample_rate() as f64 * self.clock.get_channels() as f64) as u64;
+        let pos =
+            (time * self.clock.get_sample_rate() as f64 * self.clock.get_channels() as f64) as u64;
         self.clock.set_sample_pos(pos);
         self.clock.signal_clear_buffer();
         self.clock.set_eos(false);
@@ -258,6 +298,10 @@ impl AudioEngine {
 
     pub fn is_playing(&self) -> bool {
         self.clock.get_state() == PlaybackState::Playing
+    }
+
+    pub fn get_metadata(&self) -> Option<&AudioMetadata> {
+        self.current_metadata.as_ref()
     }
 }
 

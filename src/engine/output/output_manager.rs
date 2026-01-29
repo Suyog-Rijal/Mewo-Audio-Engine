@@ -105,4 +105,10 @@ impl AudioOutput for OutputManager {
     fn tick(&mut self) {
         self.check_connection();
     }
+
+    fn clear_buffer(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            backend.clear_buffer();
+        }
+    }
 }

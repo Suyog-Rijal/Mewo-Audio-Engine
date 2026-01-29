@@ -143,6 +143,14 @@ impl AudioOutput for CpalBackend {
     }
 
     fn tick(&mut self) {}
+
+    fn clear_buffer(&mut self) {
+        if let Ok(mut guard) = self.consumer.lock() {
+            if let Some(c) = guard.as_mut() {
+                c.clear();
+            }
+        }
+    }
 }
 
 fn process_audio<T: Sample + FromSample<f32>>(

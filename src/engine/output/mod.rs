@@ -12,4 +12,5 @@ pub trait AudioOutput: Send {
     fn is_healthy(&self) -> bool;
     fn shutdown(&mut self) -> Option<AudioBufferConsumer>;
     fn tick(&mut self);
+    fn clear_buffer(&mut self);
 }

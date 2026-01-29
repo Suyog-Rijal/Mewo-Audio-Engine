@@ -8,7 +8,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
-use crate::engine::decoder::AudioDecoder;
+use crate::engine::decoder::{AudioDecoder, AudioMetadata};
 
 pub struct SymphoniaDecoder {
     reader: Box<dyn FormatReader>,
@@ -17,6 +17,7 @@ pub struct SymphoniaDecoder {
     sample_rate: u32,
     channels: u32,
     duration: Option<f64>,
+    metadata: AudioMetadata,
 }
 
 impl SymphoniaDecoder {
@@ -35,7 +36,23 @@ impl SymphoniaDecoder {
         let dec_opts = DecoderOptions::default();
 
         let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
-        let reader = probed.format;
+        let mut reader = probed.format;
+
+        // --- Extract Metadata ---
+        let mut metadata = AudioMetadata::default();
+
+        // Access visual tags
+        if let Some(ref current_metadata) = reader.metadata().current() {
+            for tag in current_metadata.tags() {
+                // Symphonia standardizes keys to uppercase, usually "ARTIST", "TITLE", etc.
+                match tag.key.as_str() {
+                    "ARTIST" => metadata.artist = Some(tag.value.to_string()),
+                    "TITLE" => metadata.title = Some(tag.value.to_string()),
+                    "ALBUM" => metadata.album = Some(tag.value.to_string()),
+                    _ => {}
+                }
+            }
+        }
 
         let track = reader.tracks()
             .iter()
@@ -52,6 +69,9 @@ impl SymphoniaDecoder {
             frames as f64 / sample_rate as f64
         });
 
+        // Ensure duration is in metadata struct
+        metadata.duration_secs = duration;
+
         Ok(Self {
             reader,
             decoder,
@@ -59,6 +79,7 @@ impl SymphoniaDecoder {
             sample_rate,
             channels,
             duration,
+            metadata,
         })
     }
 }
@@ -118,5 +139,9 @@ impl AudioDecoder for SymphoniaDecoder {
 
     fn duration(&self) -> Option<f64> {
         self.duration
+    }
+
+    fn metadata(&self) -> Option<AudioMetadata> {
+        Some(self.metadata.clone())
     }
 }
