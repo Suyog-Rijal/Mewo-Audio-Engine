@@ -41,7 +41,6 @@ impl Resampler {
             let chunk: Vec<f32> = self.buffer.drain(0..self.chunk_size * self.channels).collect();
             let num_frames = self.chunk_size;
 
-            // De-interleave into Vec<Vec<f32>>
             let mut input_buffer = vec![vec![0.0; num_frames]; self.channels];
             for i in 0..num_frames {
                 for ch in 0..self.channels {
@@ -52,7 +51,6 @@ impl Resampler {
             let out_len = self.resampler.output_frames_next();
             let mut output_buffer = vec![vec![0.0; out_len]; self.channels];
 
-            // Wrap with SequentialSliceOfVecs adapter
             let input_adapter = SequentialSliceOfVecs::new(&input_buffer, self.channels, num_frames)?;
             let mut output_adapter = SequentialSliceOfVecs::new_mut(&mut output_buffer, self.channels, out_len)?;
 
@@ -62,7 +60,6 @@ impl Resampler {
                 None,
             )?;
 
-            // Interleave
             for i in 0..out_len {
                 for ch in 0..self.channels {
                     all_output.push(output_buffer[ch][i]);
@@ -78,7 +75,6 @@ impl Resampler {
             return Ok(Vec::new());
         }
 
-        // Pad with zeros to complete a chunk
         let remaining_frames = self.buffer.len() / self.channels;
         let padding_needed = (self.chunk_size - remaining_frames) * self.channels;
         self.buffer.extend(vec![0.0; padding_needed]);

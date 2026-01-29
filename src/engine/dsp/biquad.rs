@@ -4,6 +4,7 @@ pub enum FilterType {
     HighPass,
     LowShelf,
     LowPass,
+    HighShelf,
 }
 
 pub struct BiquadFilter {
@@ -48,11 +49,11 @@ impl BiquadFilter {
         let w0 = 2.0 * PI * frequency / sample_rate;
         let cos = w0.cos();
         let sin = w0.sin();
-        let alpha = sin / (2.0 * q);
         let a = 10.0f32.powf(gain_db / 40.0);
 
         match filter_type {
             FilterType::HighPass => {
+                let alpha = sin / (2.0 * q);
                 let b0 = (1.0 + cos) / 2.0;
                 let b1 = -(1.0 + cos);
                 let b2 = (1.0 + cos) / 2.0;
@@ -68,6 +69,7 @@ impl BiquadFilter {
             }
 
             FilterType::LowPass => {
+                let alpha = sin / (2.0 * q);
                 let b0 = (1.0 - cos) / 2.0;
                 let b1 = 1.0 - cos;
                 let b2 = (1.0 - cos) / 2.0;
@@ -91,6 +93,23 @@ impl BiquadFilter {
                 let a0 = (a + 1.0) + (a - 1.0) * cos + alpha;
                 let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos);
                 let a2 = (a + 1.0) + (a - 1.0) * cos - alpha;
+
+                self.b0 = b0 / a0;
+                self.b1 = b1 / a0;
+                self.b2 = b2 / a0;
+                self.a1 = a1 / a0;
+                self.a2 = a2 / a0;
+            }
+
+            FilterType::HighShelf => {
+                let alpha = sin / 2.0 * ((a + 1.0 / a) * (1.0 / q - 1.0) + 2.0).sqrt();
+
+                let b0 = a * ((a + 1.0) + (a - 1.0) * cos + alpha);
+                let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos);
+                let b2 = a * ((a + 1.0) + (a - 1.0) * cos - alpha);
+                let a0 = (a + 1.0) - (a - 1.0) * cos + alpha;
+                let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos);
+                let a2 = (a + 1.0) - (a - 1.0) * cos - alpha;
 
                 self.b0 = b0 / a0;
                 self.b1 = b1 / a0;

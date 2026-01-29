@@ -10,11 +10,11 @@ impl HighFreqEQ {
         let mut filters = Vec::with_capacity(channels);
         for _ in 0..channels {
             filters.push(BiquadFilter::new(
-                FilterType::LowPass,
+                FilterType::HighShelf,
                 sample_rate,
-                18000.0,
-                0.707,
-                0.0,
+                12000.0,
+                0.7,
+                -1.5,
             ));
         }
 

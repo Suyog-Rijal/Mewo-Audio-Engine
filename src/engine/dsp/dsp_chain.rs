@@ -13,7 +13,7 @@ impl DspChain {
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let mut limiter = Vec::new();
         for _ in 0..channels {
-            limiter.push(Limiter::new(-0.3, sample_rate));
+            limiter.push(Limiter::new(-0.1, sample_rate));
         }
 
         Self {

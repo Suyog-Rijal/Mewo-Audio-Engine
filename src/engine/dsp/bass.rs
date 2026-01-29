@@ -1,10 +1,8 @@
 use crate::engine::dsp::biquad::{BiquadFilter, FilterType};
-use crate::engine::dsp::limiter::Limiter;
 
 pub struct BassProcessor {
     high_pass: Vec<BiquadFilter>,
     shelf: Vec<BiquadFilter>,
-    limiter: Vec<Limiter>,
     channels: usize,
     sample_rate: f32,
     low_energy: Vec<f32>,
@@ -20,18 +18,15 @@ impl BassProcessor {
     pub fn new(sample_rate: f32, channels: usize) -> Self {
         let mut high_pass = Vec::new();
         let mut shelf = Vec::new();
-        let mut limiter = Vec::new();
 
         for _ in 0..channels {
             high_pass.push(BiquadFilter::new(FilterType::HighPass, sample_rate, 30.0, 0.707, 0.0));
-            shelf.push(BiquadFilter::new(FilterType::LowShelf, sample_rate, 120.0, 0.5, 0.0));
-            limiter.push(Limiter::new(-0.5, sample_rate));
+            shelf.push(BiquadFilter::new(FilterType::LowShelf, sample_rate, 60.0, 0.6, 0.0));
         }
 
         Self {
             high_pass,
             shelf,
-            limiter,
             channels,
             sample_rate,
             low_energy: vec![0.0; channels],
@@ -54,14 +49,14 @@ impl BassProcessor {
 
     fn update_gain(&mut self) {
         let diff = self.target_gain - self.current_gain;
-        if diff.abs() > 0.001 {
-            self.current_gain += diff * 0.001;
+        if diff.abs() > 0.0001 {
+            self.current_gain += diff * 0.005;
             for ch in 0..self.channels {
                 self.shelf[ch].update(
                     FilterType::LowShelf,
                     self.sample_rate,
-                    120.0,
-                    0.5,
+                    60.0,
+                    0.6,
                     self.current_gain,
                 );
             }
@@ -77,12 +72,11 @@ impl BassProcessor {
                 let idx = i * self.channels + ch;
                 let input = samples[idx];
 
-                self.total_energy[ch] += input.abs();
-                self.low_energy[ch] += input.abs();
+                self.total_energy[ch] += input * input;
+                self.low_energy[ch] += input * input;
 
                 let mut x = self.high_pass[ch].process(input);
                 x = self.shelf[ch].process(x);
-                x = self.limiter[ch].process(x);
 
                 samples[idx] = x;
             }
@@ -101,7 +95,7 @@ impl BassProcessor {
             return;
         }
 
-        let max_gain = (self.intensity / 100.0) * 6.0;
+        let max_gain = (self.intensity / 100.0) * 8.0;
 
         let mut bass_ratio = 0.0;
         let mut total = 0.0;
@@ -110,8 +104,8 @@ impl BassProcessor {
             let t = self.total_energy[ch] / self.count as f32;
             let l = self.low_energy[ch] / self.count as f32;
 
-            if t > 0.0001 {
-                bass_ratio += l / t;
+            if t > 0.000001 {
+                bass_ratio += (l / t).sqrt();
             }
 
             total += t;
@@ -122,11 +116,11 @@ impl BassProcessor {
         bass_ratio /= self.channels as f32;
         total /= self.channels as f32;
 
-        if total > 0.001 {
-            if bass_ratio < 0.35 {
-                self.target_gain = (self.target_gain + 0.5).min(max_gain);
-            } else if bass_ratio > 0.55 {
-                self.target_gain = (self.target_gain - 0.5).max(0.0);
+        if total > 0.0001 {
+            if bass_ratio < 0.4 {
+                self.target_gain = (self.target_gain + 0.2).min(max_gain);
+            } else if bass_ratio > 0.6 {
+                self.target_gain = (self.target_gain - 0.2).max(0.0);
             }
         }
 
