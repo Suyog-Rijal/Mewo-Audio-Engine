@@ -25,7 +25,6 @@ impl CpalBackend {
         };
 
         let device_id = device.name().unwrap_or_else(|_| "unknown".to_string());
-
         let config_res = device.default_output_config();
         let config_inner = match config_res {
             Ok(c) => c,
@@ -42,7 +41,6 @@ impl CpalBackend {
         let is_healthy_err = is_healthy.clone();
 
         let err_fn = move |err| {
-            // eprintln!("An error occurred on the output audio stream: {}", err);
             is_healthy_err.store(false, Ordering::SeqCst);
         };
 
@@ -94,15 +92,15 @@ impl CpalBackend {
         };
 
         match stream_res {
-            Ok(stream) => Ok(Self { 
-                _stream: stream, 
+            Ok(stream) => Ok(Self {
+                _stream: stream,
                 device_id,
-                is_healthy, 
-                consumer: shared_consumer 
+                is_healthy,
+                consumer: shared_consumer,
             }),
             Err(e) => {
                 let consumer = shared_consumer.lock().unwrap().take().unwrap();
-                Err((consumer, e.into())) 
+                Err((consumer, e.into()))
             }
         }
     }
@@ -128,8 +126,6 @@ impl AudioOutput for CpalBackend {
         if !self.is_healthy.load(Ordering::SeqCst) {
             return false;
         }
-
-        // Check if default device has changed
         let host = cpal::default_host();
         if let Some(device) = host.default_output_device() {
             if let Ok(name) = device.name() {
@@ -138,7 +134,6 @@ impl AudioOutput for CpalBackend {
                 }
             }
         }
-
         true
     }
 
@@ -147,12 +142,9 @@ impl AudioOutput for CpalBackend {
         self.consumer.lock().ok()?.take()
     }
 
-    fn tick(&mut self) {
-        // CpalBackend doesn't do much on tick, it's mostly for the manager
-    }
+    fn tick(&mut self) {}
 }
 
-/// Real-time safe audio processing callback.
 fn process_audio<T: Sample + FromSample<f32>>(
     data: &mut [T],
     consumer: &mut AudioBufferConsumer,
@@ -172,21 +164,19 @@ fn process_audio<T: Sample + FromSample<f32>>(
 
     let samples_read = consumer.pop_slice_f32(data);
 
-    // Fill remaining with silence if underrun
     if samples_read < data.len() {
         for sample in &mut data[samples_read..] {
             *sample = T::from_sample(0.0);
         }
     }
 
-    // Increment clock. We assume interleaved data, so we divide by channel count
-    // to get sample position, but usually clock tracks "frames" or "total samples".
-    // According to our Clock definition, it's sample_pos.
     clock.increment_samples(samples_read as u64);
+
+    if samples_read == 0 && clock.is_eos() {
+        clock.set_state(PlaybackState::Stopped);
+    }
 }
 
-/// Helper trait extension for AudioBufferConsumer to support generic sample conversion
-/// since pop_slice works on f32 but we need to convert to T.
 trait ConsumerExt {
     fn pop_slice_f32<T: Sample + FromSample<f32>>(&mut self, data: &mut [T]) -> usize;
 }

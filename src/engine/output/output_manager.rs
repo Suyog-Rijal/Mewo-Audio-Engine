@@ -17,7 +17,6 @@ impl OutputManager {
             consumer: Some(consumer),
             clock,
         };
-        
         let _ = manager.try_reconnect();
         manager
     }
@@ -41,7 +40,6 @@ impl OutputManager {
     }
 
     pub fn check_connection(&mut self) {
-        // If we have no backend or it's unhealthy, try to reconnect
         let needs_reconnect = match &self.backend {
             Some(backend) => !backend.is_healthy(),
             None => true,

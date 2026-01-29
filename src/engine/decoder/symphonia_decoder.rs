@@ -34,9 +34,7 @@ impl SymphoniaDecoder {
         let fmt_opts = FormatOptions::default();
         let dec_opts = DecoderOptions::default();
 
-        let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &fmt_opts, &meta_opts)?;
-
+        let probed = symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts)?;
         let reader = probed.format;
 
         let track = reader.tracks()
@@ -48,8 +46,7 @@ impl SymphoniaDecoder {
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
         let channels = track.codec_params.channels.map(|c| c.count() as u32).unwrap_or(2);
 
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &dec_opts)?;
+        let decoder = symphonia::default::get_codecs().make(&track.codec_params, &dec_opts)?;
 
         let duration = track.codec_params.n_frames.map(|frames| {
             frames as f64 / sample_rate as f64

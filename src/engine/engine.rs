@@ -3,11 +3,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-
+use std::sync::Mutex;
+use std::time::Duration;
 use crate::engine::clock::{Clock, PlaybackState};
 use crate::engine::decoder::{AudioDecoder, symphonia_decoder::SymphoniaDecoder};
 use crate::engine::buffer::{create_audio_buffer, AudioBufferProducer};
 use crate::engine::output::{AudioOutput, output_manager::OutputManager};
+
 use crate::engine::dsp::resampler::Resampler;
 use crate::engine::dsp::dsp_chain::DspChain;
 
@@ -20,9 +22,11 @@ enum DecoderCommand {
 
 pub struct AudioEngine {
     clock: Arc<Clock>,
-    output: Box<dyn AudioOutput + Send>,
+    // Wrapped in Arc<Mutex<>> so it can be shared between the decoder thread, main thread, and playback ticker thread
+    output: Arc<Mutex<Box<dyn AudioOutput + Send>>>,
     producer: Option<AudioBufferProducer>,
     decode_thread: Option<JoinHandle<()>>,
+    playback_thread: Option<JoinHandle<()>>,
     is_decoding: Arc<AtomicBool>,
     command_tx: Option<Sender<DecoderCommand>>,
     bass_boost_enabled: Arc<AtomicBool>,
@@ -33,13 +37,13 @@ impl AudioEngine {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let clock = Arc::new(Clock::new(44100));
         let (producer, consumer) = create_audio_buffer(44100 * 2);
-        let output = Box::new(OutputManager::new(consumer, clock.clone()));
-
+        let output = OutputManager::new(consumer, clock.clone());
         Ok(Self {
             clock,
-            output,
+            output: Arc::new(Mutex::new(Box::new(output))),
             producer: Some(producer),
             decode_thread: None,
+            playback_thread: None,
             is_decoding: Arc::new(AtomicBool::new(false)),
             command_tx: None,
             bass_boost_enabled: Arc::new(AtomicBool::new(false)),
@@ -49,9 +53,9 @@ impl AudioEngine {
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn std::error::Error>> {
         self.stop();
-
         let mut decoder = SymphoniaDecoder::new(path)?;
         let mut producer = self.producer.take().ok_or("Producer missing")?;
+
         let is_decoding = self.is_decoding.clone();
         let clock = self.clock.clone();
         let bass_boost_enabled = self.bass_boost_enabled.clone();
@@ -59,7 +63,6 @@ impl AudioEngine {
 
         let mut output_rate = clock.get_sample_rate();
         let mut output_channels = clock.get_channels();
-
         let decoder_rate = decoder.sample_rate();
         let decoder_channels = decoder.channels() as usize;
 
@@ -77,8 +80,8 @@ impl AudioEngine {
 
         let (tx, rx) = mpsc::channel();
         self.command_tx = Some(tx);
-
         is_decoding.store(true, Ordering::SeqCst);
+        clock.set_eos(false);
         clock.set_sample_pos(0);
 
         let handle = thread::spawn(move || {
@@ -88,6 +91,7 @@ impl AudioEngine {
                         DecoderCommand::Seek(t) => {
                             decoder.seek(t);
                             producer.clear();
+                            clock.set_eos(false);
                         }
                         DecoderCommand::Stop => {
                             is_decoding.store(false, Ordering::SeqCst);
@@ -100,28 +104,24 @@ impl AudioEngine {
 
                 let rate = clock.get_sample_rate();
                 let ch = clock.get_channels();
-
                 if rate != output_rate || ch != output_channels {
                     output_rate = rate;
                     output_channels = ch;
-
                     resampler = if decoder_rate != output_rate || decoder_channels != output_channels as usize {
                         Some(Resampler::new(decoder_rate, output_rate, decoder_channels, 1024).unwrap())
                     } else {
                         None
                     };
-
                     dsp = DspChain::new(output_rate as f32, output_channels as usize);
                     dsp.bass.set_enabled(bass_boost_enabled.load(Ordering::SeqCst));
                     if let Ok(v) = bass_boost_intensity.lock() {
                         dsp.bass.set_intensity(*v);
                     }
-
                     producer.clear();
                 }
 
                 if producer.vacant_len() < 1024 {
-                    thread::sleep(std::time::Duration::from_millis(5));
+                    thread::sleep(Duration::from_millis(5));
                     continue;
                 }
 
@@ -129,7 +129,6 @@ impl AudioEngine {
                     if let Some(r) = &mut resampler {
                         samples = r.process(&samples).unwrap_or(samples);
                     }
-
                     dsp.process(&mut samples);
 
                     let mut pushed = 0;
@@ -137,7 +136,7 @@ impl AudioEngine {
                         let n = producer.push_slice(&samples[pushed..]);
                         pushed += n;
                         if n == 0 {
-                            thread::sleep(std::time::Duration::from_millis(2));
+                            thread::sleep(Duration::from_millis(2));
                         }
                     }
                 } else {
@@ -146,6 +145,7 @@ impl AudioEngine {
                             producer.push_slice(&flush);
                         }
                     }
+                    clock.set_eos(true);
                     is_decoding.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -157,32 +157,73 @@ impl AudioEngine {
     }
 
     pub fn play(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.is_playing() {
+            return Ok(());
+        }
+
+        // Ensure any previous playback thread is cleaned up
+        if let Some(h) = self.playback_thread.take() {
+            let _ = h.join();
+        }
+
         self.clock.set_state(PlaybackState::Playing);
-        self.output.start()?;
+
+        // Lock output to start the stream
+        if let Ok(mut out) = self.output.lock() {
+            out.start()?;
+        }
+
+        // Spawn a background thread to handle "ticking" (device management)
+        let output_arc = self.output.clone();
+        let clock = self.clock.clone();
+
+        let handle = thread::spawn(move || {
+            // This loop runs as long as the state is not Stopped
+            // It handles device reconnection and health checks automatically
+            while clock.get_state() != PlaybackState::Stopped {
+                if let Ok(mut out) = output_arc.lock() {
+                    out.tick();
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        self.playback_thread = Some(handle);
         Ok(())
     }
 
     pub fn pause(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.clock.set_state(PlaybackState::Paused);
-        self.output.pause()?;
+        if let Ok(mut out) = self.output.lock() {
+            out.pause()?;
+        }
         Ok(())
     }
 
     pub fn stop(&mut self) {
         self.clock.set_state(PlaybackState::Stopped);
-        let _ = self.output.stop();
 
+        // Stop output stream
+        if let Ok(mut out) = self.output.lock() {
+            let _ = out.stop();
+        }
+
+        // Stop decoder
         if let Some(tx) = self.command_tx.take() {
             let _ = tx.send(DecoderCommand::Stop);
         }
-
         self.is_decoding.store(false, Ordering::SeqCst);
-
         if let Some(h) = self.decode_thread.take() {
             let _ = h.join();
         }
 
+        // Stop the playback management thread
+        if let Some(h) = self.playback_thread.take() {
+            let _ = h.join();
+        }
+
         self.clock.set_sample_pos(0);
+        self.clock.set_eos(false);
     }
 
     pub fn set_bass_boost(&self, enabled: bool) {
@@ -205,6 +246,7 @@ impl AudioEngine {
         let pos = (time * self.clock.get_sample_rate() as f64 * self.clock.get_channels() as f64) as u64;
         self.clock.set_sample_pos(pos);
         self.clock.signal_clear_buffer();
+        self.clock.set_eos(false);
         if let Some(tx) = &self.command_tx {
             let _ = tx.send(DecoderCommand::Seek(time));
         }
@@ -214,8 +256,8 @@ impl AudioEngine {
         self.clock.get_time_secs()
     }
 
-    pub fn tick(&mut self) {
-        self.output.tick();
+    pub fn is_playing(&self) -> bool {
+        self.clock.get_state() == PlaybackState::Playing
     }
 }
 
